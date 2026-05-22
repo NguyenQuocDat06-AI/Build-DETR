@@ -1,0 +1,4 @@
+coco128/
+venv/
+__pycache__/
+*.pyc
