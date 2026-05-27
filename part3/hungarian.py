@@ -2,160 +2,177 @@ import torch
 import torch.nn as nn
 from scipy.optimize import linear_sum_assignment
 
+def box_cxcywh_to_xyxy(x: torch.Tensor) -> torch.Tensor:
+    """
+    Change bounding box từ fomat [center_x, center_y, width, height]
+    to [x_min, y_min, x_max, y_max].
+    """
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+         (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=-1)
+
+def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor):
+    """
+    Calculate IoU between two groups of bounding boxes.
+    boxes1: [N, 4] (format xyxy)
+    boxes2: [M, 4] (format xyxy)
+    
+    Returns:
+      iou: Matrix [N, M] contains the IoU index between pairs.
+      union: Matrix [N, M] contains the area of union.
+    """
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+    # Find the coordinates of the intersection region
+    # [N, 1, 2] vs [1, M, 2] -> [N, M, 2]
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # left-top
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # right-bottom
+
+    wh = (rb - lt).clamp(min=0)  # [N, M, 2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N, M]
+
+    union = area1[:, None] + area2 - inter
+
+    iou = inter / (union + 1e-6)
+    return iou, union
+
+def generalized_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """
+    Calculate GIoU between two groups of bounding boxes.
+    boxes1: [N, 4] (format xyxy)
+    boxes2: [M, 4] (format xyxy)
+    
+    Returns: GIoU Matrix [N, M]
+    """
+    # Ensure the input is in xyxy format
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    
+    iou, union = box_iou(boxes1, boxes2)
+    
+    # Find the coordinates of the smallest enclosing box C that contains both boxes
+    lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
+
+    wh = (rb - lt).clamp(min=0)  # [N, M, 2]
+    area_c = wh[:, :, 0] * wh[:, :, 1]  # Area of C
+
+    return iou - (area_c - union) / (area_c + 1e-6)
+
 class HungarianMatcher(nn.Module):
     """
-    Performs bipartite matching between predictions and ground truth using the Hungarian algorithm.
+    The Hungarian Matcher module performs optimal 1-to-1 assignment between
+    ground truth objects and model predictions (Bipartite Matching).
     """
-    def __init__(self, cost_class: float = 1, cost_bbox: float = 5.0, cost_giou: float = 2.0):
-        """
-        Initialize the HungarianMatcher.
-        
-        Args:
-            cost_class: Weight for classification cost.
-            cost_bbox: Weight for L1 (bbox) cost.
-            cost_giou: Weight for GIoU cost.
-        """
+    def __init__(self, cost_class: float = 1.0, cost_bbox: float = 5.0, cost_giou: float = 2.0):
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert cost_class + cost_bbox + cost_giou > 0
-
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """
-        Calculate classification loss (Cross-Entropy).
-        """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         
-        # Classification probabilities
-        src_prob = F.softmax(src_logits, -1)
-        src_prob = src_prob.view(-1, src_prob.shape[-1])
-        
-        # Loss
-        loss_ce = F.cross_entropy(src_logits[idx], target_classes_o, weight=None)
-        losses = {'loss_ce': loss_ce}
-
-        if log:
-            # Calculate accuracy
-            prob = src_prob[idx].max(-1)[1]
-            acc = (prob == target_classes_o).float().mean()
-            losses['class_error'] = 1 - acc
-        
-        return losses, src_prob, target_classes_o
-
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    @torch.no_grad()
+    def forward(self, outputs: dict, targets: list) -> list:
         """
-        Calculate bounding box loss (L1 + GIoU).
-        """
-        assert 'pred_boxes' in outputs
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][J] for t, (_, J) in zip(targets, indices)], dim=0)
-
-        # L1 Loss
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
-        losses = {}  # We'll add this later
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
-        # GIoU Loss
-        loss_giou = 1 - generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), 
-                                            box_cxcywh_to_xyxy(target_boxes))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
-        
-        return losses, src_boxes, target_boxes
-
-    def _get_src_permutation_idx(self, indices):
-        """
-        Get the flat indices for the source predictions that were matched.
-        """
-        batch_idx = torch.cat([torch.full_like(J, i) for i, (_, J) in enumerate(indices)])
-        src_idx = torch.cat([J for (_, J) in indices])
-        return batch_idx, src_idx
-
-    def __call__(self, outputs, targets):
-        """
-        Perform Hungarian matching.
-        
-        Args:
-            outputs: Dictionary from the DETR model containing 'pred_logits' and 'pred_boxes'.
-            targets: List of ground truth dictionaries.
-            
+        outputs: Dict contains:
+           - "pred_logits": Tensor [Batch_size, Num_Queries, Num_Classes + 1] (class logits)
+           - "pred_boxes": Tensor [Batch_size, Num_Queries, 4] (hộp dạng [cx, cy, w, h])
+        targets: List with length Batch_size, each element is a Dict contains:
+           - "labels": Tensor [M] (ground truth class labels)
+           - "boxes": Tensor [M, 4] (ground truth coordinates in [cx, cy, w, h] format)
+           
         Returns:
-            A tuple containing:
-            - losses: Dictionary of losses.
-            - indices: Tuple of matched indices ((batch_idx, src_idx), (batch_idx, tgt_idx)).
-            - matched_obj_probs: Probabilities of matched objects.
-            - matched_tgt_classes: Ground truth classes of matched objects.
+           A list with length Batch_size. Each element is a tuple (index_i, index_j) where:
+             - index_i: Tensor contains the indices of the predictions matched.
+             - index_j: Tensor contains the indices of the corresponding ground truth labels.
         """
-        with torch.no_grad():
-            # 1. Calculate Cost Matrix
-            C = self.calculate_cost_matrix(outputs, targets)
-
-            # 2. Apply Hungarian Algorithm
-            # C shape is [Batch_size, num_queries, num_gt]
-            # We apply it to each image in the batch independently
-            C_bsz = C.shape[0]
-            C_ = C.cpu() # linear_sum_assignment only works on CPU
-            
-            indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C_)]
-            # indices is a list of tuples: [((row_idx, col_idx), (row_idx, col_idx)), ...]
-            # We need to convert this to the format used by loss functions
-            
-            # Format: ((batch_idx, src_idx), (batch_idx, tgt_idx))
-            # src_idx corresponds to queries, tgt_idx corresponds to ground truth
-            bs_idx = torch.arange(C_bsz, device=C.device)
-            
-            # Extract source and target indices
-            # src_idx_matched: Flat indices of queries that were matched
-            src_idx_matched = torch.cat([ind[0] for ind in indices])
-            # tgt_idx_matched: Flat indices of ground truths that were matched
-            tgt_idx_matched = torch.cat([ind[1] for ind in indices])
-            
-            # Batch indices for source and target
-            bs_idx_src = torch.cat([bs_idx.unsqueeze(1).expand_as(ind[0]) for ind in indices], dim=0)
-            bs_idx_tgt = torch.cat([bs_idx.unsqueeze(1).expand_as(ind[1]) for ind in indices], dim=0)
-            
-            # Final indices tuple
-            indices_out = ((bs_idx_src, src_idx_matched), (bs_idx_tgt, tgt_idx_matched))
-
-            # 3. Calculate Losses
-            # Get predicted object probabilities for the matched queries
-            pred_logits = outputs['pred_logits']
-            idx = self._get_src_permutation_idx(indices_out)
-            matched_obj_probs = F.softmax(pred_logits, dim=-1)[idx]
-            
-            # Get ground truth classes for the matched targets
-            matched_tgt_classes = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices_out[1])])
-            
-            # Loss calculations
-            losses, _, _ = self.loss_labels(outputs, targets, indices_out, None, log=False)
-            losses.update(self.loss_boxes(outputs, targets, indices_out, None))
-            
-            # 4. Compute Total Loss
-            # Cost is negative log probability of the correct class + weighted costs for bbox and GIoU
-            # Note: loss_ce is positive, so we subtract it to convert from log-likelihood to cost
-            # This is because we want to minimize cost, and maximizing likelihood means minimizing negative log-likelihood
-            cls_cost = -matched_obj_probs[:, matched_tgt_classes]
-            
-            total_cost = (self.cost_bbox * losses['loss_bbox'] + 
-                          self.cost_giou * losses['loss_giou'] + 
-                          self.cost_class * cls_cost)
-            
-            # Reshape total_cost to match the format of C for consistency (optional, but good for debugging)
-            # Actually, let's keep it as a flat tensor for the loss function
-            
-            return losses, indices_out, matched_obj_probs, matched_tgt_classes, total_cost
-
-    def calculate_cost_matrix(self, outputs, targets):
-        """
-        Calculate the cost matrix between predictions and ground truth.
+        bs, num_queries = outputs["pred_logits"].shape[:2]
         
-        Cost = cost_class * (-log(p(correct_class))) + 
-               cost_bbox * L1_loss + 
-               cost_giou * (1 - GIoU)
+        # 1. Flatten all predictions in the batch
+        # [B * N, C]
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+        # [B * N, 4]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)
         
-        Args:
-            outputs: Model predictions
+        # 2. Flatten all ground truth labels in the batch
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        
+        # 3. Calculate Classification Cost
+        # At each ground truth label c, the cost is -the probability of predicting that label
+        cost_class = -out_prob[:, tgt_ids]
+        
+        # 4. Calculate L1 distance cost for box coordinates
+        # [B * N, M]
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        
+        # 5. Calculate GIoU cost
+        # Convert to xyxy before calculating GIoU
+        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), 
+                                         box_cxcywh_to_xyxy(tgt_bbox))
+        
+        # 6. Combine the complete cost matrix
+        C = self.cost_class * cost_class + self.cost_bbox * cost_bbox + self.cost_giou * cost_giou
+        # Reshape the cost matrix to [Batch_size, Num_Queries, Total_Targets_in_Batch]
+        C = C.view(bs, num_queries, -1).cpu()
+        
+        # Get the number of actual objects in each image
+        sizes = [len(v["labels"]) for v in targets]
+        
+        # 7. Iterate through each image in the batch to solve the optimal assignment algorithm
+        indices = []
+        for i, (c_slice, size) in enumerate(zip(C.split(sizes, -1), sizes)):
+            if size == 0:
+                # If the image contains no objects, the matching pair is empty
+                indices.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
+                continue
+                
+            # Extract the cost matrix of the i-th image: [Num_Queries, size]
+            cost_matrix = c_slice[i].numpy()
+            
+            # Run the Hungarian algorithm on the CPU
+            # out_ind: indices of predictions selected, tgt_ind: indices of ground truth labels corresponding
+            out_ind, tgt_ind = linear_sum_assignment(cost_matrix)
+            
+            indices.append((
+                torch.as_tensor(out_ind, dtype=torch.int64),
+                torch.as_tensor(tgt_ind, dtype=torch.int64)
+            ))
+            
+        return indices
+
+if __name__ == '__main__':
+    # Assume parameters
+    num_classes = 80 # For example, COCO dataset has 80 classes
+    
+    # 1. Assume model output: Batch_size=1, 100 queries
+    pred_logits = torch.randn(1, 100, num_classes + 1) # +1 channel for empty class
+    pred_boxes = torch.rand(1, 100, 4) # Random coordinates [cx, cy, w, h] in [0, 1]
+    
+    outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
+    
+    # 2. Assume ground truth labels: 3 objects in the image
+    targets = [{
+        "labels": torch.tensor([3, 17, 52], dtype=torch.long), # Nhãn của 3 vật thể
+        "boxes": torch.tensor([
+            [0.5, 0.5, 0.2, 0.2],
+            [0.3, 0.4, 0.1, 0.3],
+            [0.8, 0.2, 0.4, 0.1]
+        ], dtype=torch.float32)
+    }]
+    
+    # 3. Initialize Hungarian Matcher
+    matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0)
+    
+    # Find bipartite matching
+    indices = matcher(outputs, targets)
+    
+    # Get the first image result
+    pred_idx, tgt_idx = indices[0]
+    
+    print(f"Indices of predictions selected from 100 Queries: {pred_idx.tolist()}")
+    print(f"Indices of ground truth labels corresponding matched: {tgt_idx.tolist()}")
+    
+    assert len(pred_idx) == 3, "Error: The number of matches must be equal to the number of actual objects (3)!"
+    print("Success! Hungarian Matcher performs perfect 1-to-1 matching!")
